@@ -1,0 +1,193 @@
+package myplugin;
+
+import com.comphenix.protocol.ProtocolLibrary;
+import com.comphenix.protocol.ProtocolManager;
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.wrappers.*;
+import com.comphenix.protocol.wrappers.EnumWrappers.PlayerInfoAction;
+import com.mojang.authlib.GameProfile;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.ArmorStand;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerInteractAtEntityEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.*;
+
+public class SimpleNPCPlugin extends JavaPlugin implements Listener {
+
+    private ProtocolManager protocolManager;
+    private Map<UUID, NPCData> npcMap = new HashMap<>(); // UUID NPC => Data
+
+    @Override
+    public void onEnable() {
+        protocolManager = ProtocolLibrary.getProtocolManager();
+        Bukkit.getPluginManager().registerEvents(this, this);
+        getLogger().info("SimpleNPCPlugin Enabled");
+    }
+
+    // NPC بيانات
+    private static class NPCData {
+        String name;
+        Location location;
+        String worldToTeleport;
+        EntityType entityType; // PLAYER or any mob type
+        UUID uuid;
+        LivingEntity entity; // موجودة اذا Mob حقيقي
+
+        NPCData(String name, Location loc, String world, EntityType type, UUID uuid) {
+            this.name = name;
+            this.location = loc;
+            this.worldToTeleport = world;
+            this.entityType = type;
+            this.uuid = uuid;
+            this.entity = null;
+        }
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Command only for players.");
+            return true;
+        }
+
+        if (command.getName().equalsIgnoreCase("spawnnpc")) {
+            if (args.length < 3) {
+                player.sendMessage("Usage: /spawnnpc <name> <player|mob> <world> [mobType]");
+                return true;
+            }
+
+            String npcName = args[0];
+            String typeStr = args[1].toLowerCase();
+            String worldName = args[2];
+            World world = Bukkit.getWorld(worldName);
+            if (world == null) {
+                player.sendMessage("World not found: " + worldName);
+                return true;
+            }
+
+            EntityType entityType;
+            if (typeStr.equals("player")) {
+                entityType = EntityType.PLAYER;
+            } else {
+                try {
+                    entityType = EntityType.valueOf(typeStr.toUpperCase());
+                } catch (IllegalArgumentException e) {
+                    player.sendMessage("Invalid mob type: " + typeStr);
+                    return true;
+                }
+            }
+
+            Location loc = player.getLocation();
+
+            if (entityType == EntityType.PLAYER) {
+                // نسوي NPC لاعب وهمي باستخدام Packet
+                spawnFakePlayerNPC(player, loc, npcName, worldName);
+            } else {
+                // نسوي موبايل حقيقي
+                spawnMobNPC(player, loc, npcName, worldName, entityType);
+            }
+
+            player.sendMessage("NPC Created: " + npcName + " Type: " + entityType.name() + " World: " + worldName);
+            return true;
+        }
+
+        return false;
+    }
+
+    // إنشاء NPC لاعب وهمي
+    private void spawnFakePlayerNPC(Player toPlayer, Location loc, String name, String worldToTeleport) {
+        UUID npcUUID = UUID.randomUUID();
+        GameProfile profile = new GameProfile(npcUUID, name);
+        WrappedGameProfile wrappedProfile = WrappedGameProfile.fromHandle(profile);
+
+        WrappedPlayerInfoData playerInfoData = new WrappedPlayerInfoData(
+                wrappedProfile,
+                1,
+                com.comphenix.protocol.wrappers.EnumWrappers.NativeGameMode.SURVIVAL,
+                WrappedChatComponent.fromText(name)
+        );
+
+        PacketContainer addPlayerPacket = protocolManager.createPacket(
+                com.comphenix.protocol.PacketType.Play.Server.PLAYER_INFO
+        );
+        addPlayerPacket.getPlayerInfoAction().write(0, PlayerInfoAction.ADD_PLAYER);
+        addPlayerPacket.getPlayerInfoDataLists().write(0, Collections.singletonList(playerInfoData));
+
+        PacketContainer removePlayerPacket = protocolManager.createPacket(
+                com.comphenix.protocol.PacketType.Play.Server.PLAYER_INFO
+        );
+        removePlayerPacket.getPlayerInfoAction().write(0, PlayerInfoAction.REMOVE_PLAYER);
+        removePlayerPacket.getPlayerInfoDataLists().write(0, Collections.singletonList(playerInfoData));
+
+        PacketContainer spawnPacket = protocolManager.createPacket(
+                com.comphenix.protocol.PacketType.Play.Server.NAMED_ENTITY_SPAWN
+        );
+        spawnPacket.getIntegers().write(0, npcUUID.hashCode());
+        spawnPacket.getUUIDs().write(0, npcUUID);
+        spawnPacket.getDoubles().write(0, loc.getX());
+        spawnPacket.getDoubles().write(1, loc.getY());
+        spawnPacket.getDoubles().write(2, loc.getZ());
+        spawnPacket.getBytes().write(0, (byte) 0);
+        spawnPacket.getBytes().write(1, (byte) 0);
+
+        try {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                protocolManager.sendServerPacket(p, addPlayerPacket);
+                protocolManager.sendServerPacket(p, spawnPacket);
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    try {
+                        protocolManager.sendServerPacket(p, removePlayerPacket);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }, 20L);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        // نسجل الـ NPC في الخريطة مع بياناته
+        npcMap.put(npcUUID, new NPCData(name, loc, worldToTeleport, EntityType.PLAYER, npcUUID));
+    }
+
+    // إنشاء NPC موبايل حقيقي
+    private void spawnMobNPC(Player player, Location loc, String name, String worldToTeleport, EntityType type) {
+        LivingEntity mob = (LivingEntity) player.getWorld().spawnEntity(loc, type);
+        mob.setCustomName(name);
+        mob.setCustomNameVisible(true);
+        mob.setPersistent(true);
+        mob.setInvulnerable(true);
+        mob.setSilent(true);
+
+        npcMap.put(mob.getUniqueId(), new NPCData(name, loc, worldToTeleport, type, mob.getUniqueId()));
+    }
+
+    // حدث التفاعل مع NPC
+    @EventHandler
+    public void onPlayerInteractAtEntity(PlayerInteractAtEntityEvent event) {
+        Player player = event.getPlayer();
+        UUID entityId = event.getRightClicked().getUniqueId();
+
+        if (npcMap.containsKey(entityId)) {
+            NPCData data = npcMap.get(entityId);
+            World targetWorld = Bukkit.getWorld(data.worldToTeleport);
+            if (targetWorld != null) {
+                player.teleport(targetWorld.getSpawnLocation());
+                player.sendMessage("تم نقلك إلى العالم: " + data.worldToTeleport);
+            } else {
+                player.sendMessage("العالم الهدف غير موجود.");
+            }
+            event.setCancelled(true);
+        }
+    }
+}
